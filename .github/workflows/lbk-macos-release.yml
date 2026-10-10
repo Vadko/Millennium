@@ -29,6 +29,8 @@ jobs:
           # Xcode on macos-14 ships a libc++ too old for this tree; macos-15 has a current one.
           - runner: macos-15
             arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
 
     steps:
