@@ -30,8 +30,10 @@ readonly WRAPPER_RUNTIME_ARTIFACTS=(
     "libmillennium_luavm_x86"
 )
 readonly WRAPPER_ASSET_RELATIVE_DIR="millennium-assets"
-readonly APP_INFO_TEMPLATE="${REPO_ROOT}/src/bootstrap/macos/Info.plist.xml"
-readonly APP_ICON_SOURCE="${REPO_ROOT}/src/bootstrap/macos/AppIcon.icns"
+APP_INFO_TEMPLATE="${REPO_ROOT}/src/bootstrap/macos/Info.plist.xml"
+APP_ICON_SOURCE="${REPO_ROOT}/src/bootstrap/macos/AppIcon.icns"
+ASSET_LOADER_DIR="${REPO_ROOT}/src/typescript/sdk/build"
+ASSET_FRONTEND_FILE="${REPO_ROOT}/src/typescript/.frontend.bin"
 readonly DEFAULT_APP_BUNDLE_GLOBAL="/Applications/${WRAPPER_APP_NAME}"
 readonly DEFAULT_APP_BUNDLE_USER="${HOME}/Applications/${WRAPPER_APP_NAME}"
 readonly DEFAULT_RUNTIME_INSTALL_ROOT="${HOME}/Library/Application Support/Millennium/runtime"
@@ -57,6 +59,8 @@ CONFIGURE_STEAM_CFG_INHIBIT_ALL=0
 RUNTIME_SEARCH_DIRS=()
 SKIP_STEAM_CFG_INHIBIT_ALL=0
 INSTALL_VARIANT="wrapper-app"
+BUNDLE_DIR=""
+BUNDLE_VERSION=""
 
 log() { printf "%b\n" "$1"; }
 
@@ -81,6 +85,7 @@ Modes:
   --uninstall                   Remove wrapper app/runtime payload
   --wrapper-app                 Force wrapper-app install flow (default)
   --tier0-legacy                Use legacy tier0 proxy install flow (modifies Steam bundle)
+  --from-bundle <dir>           Install from an extracted release bundle instead of the repo tree
   --restore-steam-cfg           Tier0-only: restore Steam.cfg to pre-managed state
 
 Notes:
@@ -116,6 +121,10 @@ resolve_preferred_app_bundle_path() {
 
 ensure_steam_closed() {
     if pgrep -x "steam_osx" >/dev/null 2>&1 || pgrep -f "/Steam Helper" >/dev/null 2>&1; then
+        if [ "${DRY_RUN}" -eq 1 ]; then
+            log "[DRY RUN] Steam is running; a real run would stop here."
+            return 0
+        fi
         fail "Quit Steam before modifying the runtime bundle."
     fi
 }
@@ -196,7 +205,11 @@ remove_path_recursive() {
 
 resolve_install_version() {
     local version
-    version=$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || true)
+    if [ -n "${BUNDLE_VERSION}" ]; then
+        version="${BUNDLE_VERSION}"
+    else
+        version=$(git -C "${REPO_ROOT}" describe --tags --always --dirty 2>/dev/null || true)
+    fi
     if [ -z "${version}" ]; then
         version=$(git -C "${REPO_ROOT}" rev-parse --short HEAD 2>/dev/null || true)
     fi
@@ -215,10 +228,10 @@ copy_wrapper_assets_into_runtime() {
     local loader_target_dir="${asset_root}/loader"
     local chunks_target_dir="${loader_target_dir}/chunks"
 
-    local loader_build_dir="${REPO_ROOT}/src/typescript/sdk/build"
+    local loader_build_dir="${ASSET_LOADER_DIR}"
     local loader_entry="${loader_build_dir}/millennium.js"
     local chunks_source_dir="${loader_build_dir}/chunks"
-    local frontend_source="${REPO_ROOT}/src/typescript/.frontend.bin"
+    local frontend_source="${ASSET_FRONTEND_FILE}"
 
     [ -f "${loader_entry}" ] || fail "Missing loader entry asset: ${loader_entry}"
     [ -d "${chunks_source_dir}" ] || fail "Missing loader chunks directory: ${chunks_source_dir}"
@@ -508,6 +521,26 @@ restore_steam_cfg_state() {
     esac
 
     run_cmd rm -f "${steam_cfg_state}"
+}
+
+# Release bundle layout (see scripts/macos/lbk/bundle.sh):
+#   VERSION, runtime/{steam_osx,libmillennium*.dylib,libmillennium_luavm_x86,millennium-assets/}, app/{Info.plist.xml,AppIcon.icns}
+apply_bundle_mode() {
+    [ -n "${BUNDLE_DIR}" ] || return 0
+
+    [ -d "${BUNDLE_DIR}" ] || fail "Bundle directory not found: ${BUNDLE_DIR}"
+    BUNDLE_DIR="$(cd "${BUNDLE_DIR}" && pwd)"
+    [ -d "${BUNDLE_DIR}/runtime" ] || fail "Not a Millennium release bundle: ${BUNDLE_DIR}"
+
+    WRAPPER_BUILD_DIR="${BUNDLE_DIR}/runtime"
+    RUNTIME_BUILD_DIR="${BUNDLE_DIR}/runtime"
+    ASSET_LOADER_DIR="${BUNDLE_DIR}/runtime/${WRAPPER_ASSET_RELATIVE_DIR}/loader"
+    ASSET_FRONTEND_FILE="${BUNDLE_DIR}/runtime/${WRAPPER_ASSET_RELATIVE_DIR}/millennium-frontend.js"
+    APP_INFO_TEMPLATE="${BUNDLE_DIR}/app/Info.plist.xml"
+    APP_ICON_SOURCE="${BUNDLE_DIR}/app/AppIcon.icns"
+    if [ -f "${BUNDLE_DIR}/VERSION" ]; then
+        BUNDLE_VERSION="$(tr -d '[:space:]' < "${BUNDLE_DIR}/VERSION")"
+    fi
 }
 
 build_runtime_search_dirs() {
@@ -819,6 +852,11 @@ while [ $# -gt 0 ]; do
             CONFIGURE_STEAM_CFG_INHIBIT_ALL=0
             shift
             ;;
+        --from-bundle)
+            [ $# -ge 2 ] || fail "Missing value for --from-bundle"
+            BUNDLE_DIR="$2"
+            shift 2
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -832,6 +870,12 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+apply_bundle_mode
+
+if [ -n "${BUNDLE_DIR}" ] && [ "${INSTALL_VARIANT}" != "wrapper-app" ]; then
+    fail "--from-bundle only supports the wrapper-app install flow."
+fi
 
 if [ -z "${APP_BUNDLE_PATH}" ]; then
     APP_BUNDLE_PATH=$(resolve_preferred_app_bundle_path)
