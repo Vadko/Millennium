@@ -50,6 +50,11 @@ for bin in "${BINARIES[@]}"; do
     [ -f "${src}" ] || src="$(find "${BUILD_DIR}" -type f -name "${bin}" -not -path '*/CMakeFiles/*' -print -quit)"
     [ -n "${src}" ] && [ -f "${src}" ] || fail "missing build artifact ${bin}"
     install -m 0755 "${src}" "${STAGE}/runtime/${bin}"
+    # Nothing loads via @rpath, so build-machine LC_RPATH entries (CMake adds the SDK lib dir to hhx64) are dropped.
+    otool -l "${STAGE}/runtime/${bin}" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }' | sort -u \
+        | while IFS= read -r rpath; do
+            install_name_tool -delete_rpath "${rpath}" "${STAGE}/runtime/${bin}" 2>/dev/null
+        done
 done
 
 LOADER_DIR="${REPO_ROOT}/src/typescript/sdk/build"
@@ -60,6 +65,9 @@ install -m 0644 "${chunks[@]}" "${STAGE}/runtime/millennium-assets/loader/chunks
 install -m 0644 "${REPO_ROOT}/src/typescript/.frontend.bin" "${STAGE}/runtime/millennium-assets/millennium-frontend.js"
 
 install -m 0644 "${REPO_ROOT}/src/bootstrap/macos/Info.plist.xml" "${STAGE}/app/Info.plist.xml"
+# Below the binaries' minos, Finder would launch the wrapper and dyld would kill it instead of showing "requires a newer macOS".
+plutil -replace LSMinimumSystemVersion -string "${MAX_MINOS}" "${STAGE}/app/Info.plist.xml"
+plutil -lint "${STAGE}/app/Info.plist.xml" >/dev/null || fail "invalid app/Info.plist.xml"
 install -m 0644 "${REPO_ROOT}/src/bootstrap/macos/AppIcon.icns" "${STAGE}/app/AppIcon.icns"
 install -m 0755 "${REPO_ROOT}/scripts/macos/install_macos.sh" "${STAGE}/install_macos.sh"
 install -m 0644 "${REPO_ROOT}/LICENSE.md" "${STAGE}/LICENSE.md"
@@ -133,8 +141,8 @@ for bin in "${BINARIES[@]}"; do
         esac
     done <<< "${deps}"
 
-    if otool -l "${f}" | grep -A2 LC_RPATH | grep -E '/opt/homebrew|/usr/local|/Users/|/private/' ; then
-        echo "${bin}: LC_RPATH points outside the bundle"; errors=1
+    if otool -l "${f}" | grep -A2 LC_RPATH | grep -E '^ +path ' ; then
+        echo "${bin}: unexpected LC_RPATH"; errors=1
     fi
 
     minos="$(vtool -show-build "${f}" | awk '/minos/ {print $2}' | sort -V | tail -1)"
