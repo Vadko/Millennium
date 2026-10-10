@@ -32,6 +32,7 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -83,17 +84,150 @@ jobs:
       - name: Build
         run: bash scripts/macos/lbk/build.sh "${{ matrix.arch }}"
 
-      - name: Assemble and verify bundle
-        run: bash scripts/macos/lbk/bundle.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}" "${{ github.workspace }}/dist"
+      - name: Import signing certificate
+        id: signing
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          if [ -z "${CSC_LINK}" ]; then
+            echo "::warning::CSC_LINK is not set; the bundle will be ad-hoc signed and not notarized."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          keychain="${RUNNER_TEMP}/lbk-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          echo "::add-mask::${keychain_password}"
+
+          security create-keychain -p "${keychain_password}" "${keychain}"
+          security set-keychain-settings -lut 21600 "${keychain}"
+          security unlock-keychain -p "${keychain_password}" "${keychain}"
+
+          cert="${RUNNER_TEMP}/lbk-cert.p12"
+          printf '%s' "${CSC_LINK}" | base64 --decode > "${cert}"
+          security import "${cert}" -k "${keychain}" -P "${CSC_KEY_PASSWORD}" -f pkcs12 \
+            -T /usr/bin/codesign -T /usr/bin/security > /dev/null
+          rm -f "${cert}"
+
+          curl -fsSL -o "${RUNNER_TEMP}/DeveloperIDG2CA.cer" https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "${RUNNER_TEMP}/DeveloperIDG2CA.cer" -k "${keychain}" > /dev/null || true
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "${keychain_password}" "${keychain}" > /dev/null
+          existing="$(security list-keychains -d user | tr -d '"' | xargs)"
+          security list-keychains -d user -s "${keychain}" ${existing}
+
+          identity="$(security find-identity -v -p codesigning "${keychain}" | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "${identity}" ]; then
+            echo "::error::No Developer ID Application identity in CSC_LINK"
+            exit 1
+          fi
+          echo "Signing identity: ${identity}"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+          echo "keychain=${keychain}" >> "$GITHUB_OUTPUT"
+          echo "identity=${identity}" >> "$GITHUB_OUTPUT"
+
+      # bundle.sh signs every Mach-O before writing manifest.json and the tarball, so both cover the signed files.
+      - name: Assemble, sign and verify bundle
+        env:
+          LBK_SIGN_IDENTITY: ${{ steps.signing.outputs.enabled == 'true' && steps.signing.outputs.identity || '' }}
+          LBK_SIGN_KEYCHAIN: ${{ steps.signing.outputs.keychain }}
+        run: |
+          bash scripts/macos/lbk/bundle.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}" "${RUNNER_TEMP}/dist"
+          name="millennium-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}"
+          echo "BUNDLE_NAME=${name}" >> "$GITHUB_ENV"
+          echo "BUNDLE_STAGE=${RUNNER_TEMP}/dist/${name}" >> "$GITHUB_ENV"
+
+      - name: Show signatures
+        run: |
+          for f in "${BUNDLE_STAGE}"/runtime/steam_osx "${BUNDLE_STAGE}"/runtime/*.dylib "${BUNDLE_STAGE}"/runtime/libmillennium_luavm_x86; do
+            echo "== $(basename "$f")"
+            codesign -dv --verbose=4 "$f" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Authority|TeamIdentifier|Timestamp|Runtime Version)'
+            codesign -d --entitlements - --xml "$f" 2>/dev/null | plutil -p - 2>/dev/null || true
+          done
+
+      - name: Notarize
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          if [ -z "${APPLE_API_KEY}" ] || [ -z "${APPLE_API_KEY_ID}" ] || [ -z "${APPLE_API_ISSUER}" ]; then
+            echo "::error::App Store Connect API key secrets are missing"
+            exit 1
+          fi
+          key="${RUNNER_TEMP}/AuthKey_${APPLE_API_KEY_ID}.p8"
+          printf '%s\n' "${APPLE_API_KEY}" > "${key}"
+          chmod 600 "${key}"
+
+          zip="${RUNNER_TEMP}/${BUNDLE_NAME}-notarize.zip"
+          ditto -c -k --keepParent "${BUNDLE_STAGE}" "${zip}"
+
+          set +e
+          xcrun notarytool submit "${zip}" --key "${key}" --key-id "${APPLE_API_KEY_ID}" \
+            --issuer "${APPLE_API_ISSUER}" --wait --timeout 45m --output-format json > "${RUNNER_TEMP}/notary.json"
+          rc=$?
+          set -e
+          cat "${RUNNER_TEMP}/notary.json"; echo
+          id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("id",""))' "${RUNNER_TEMP}/notary.json" || true)"
+          status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("status",""))' "${RUNNER_TEMP}/notary.json" || true)"
+          if [ -n "${id}" ]; then
+            xcrun notarytool log "${id}" --key "${key}" --key-id "${APPLE_API_KEY_ID}" --issuer "${APPLE_API_ISSUER}" || true
+          fi
+          rm -f "${key}" "${zip}"
+          echo "Notarization status: ${status}"
+          echo "### Notarization (${{ matrix.arch }}): ${status} (${id})" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${rc}" -ne 0 ] || [ "${status}" != "Accepted" ]; then
+            echo "::error::Notarization failed: ${status}"
+            exit 1
+          fi
+          # Bare Mach-O files in a tarball cannot carry a stapled ticket; Gatekeeper fetches it online by cdhash.
+
+      - name: Verify tarball
+        run: |
+          cd "${RUNNER_TEMP}/dist"
+          shasum -a 256 -c "${BUNDLE_NAME}.tar.gz.sha256"
+          check="$(mktemp -d)"
+          tar -xzf "${BUNDLE_NAME}.tar.gz" -C "${check}"
+          for f in "${check}/${BUNDLE_NAME}"/runtime/steam_osx "${check}/${BUNDLE_NAME}"/runtime/*.dylib "${check}/${BUNDLE_NAME}"/runtime/libmillennium_luavm_x86; do
+            codesign --verify --strict "$f"
+          done
+          python3 - "${check}/${BUNDLE_NAME}" <<'PY'
+          import hashlib, json, os, sys
+          root = sys.argv[1]
+          files = json.load(open(os.path.join(root, "manifest.json")))["files"]
+          bad = [p for p, h in files.items() if hashlib.sha256(open(os.path.join(root, p), "rb").read()).hexdigest() != h]
+          if bad:
+              sys.exit("manifest.json mismatch: " + ", ".join(bad))
+          print(f"manifest.json matches {len(files)} files")
+          PY
+          ls -l "${BUNDLE_NAME}.tar.gz"
+          cat "${BUNDLE_NAME}.tar.gz.sha256"
+          {
+            echo "### ${BUNDLE_NAME}.tar.gz"
+            echo '```'
+            cat "${BUNDLE_NAME}.tar.gz.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: millennium-darwin-${{ matrix.arch }}
           path: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
+            ${{ runner.temp }}/dist/*.tar.gz
+            ${{ runner.temp }}/dist/*.tar.gz.sha256
           if-no-files-found: error
+
+      - name: Remove signing keychain
+        if: always()
+        run: |
+          keychain="${RUNNER_TEMP}/lbk-signing.keychain-db"
+          if [ -f "${keychain}" ]; then
+            security delete-keychain "${keychain}" || true
+          fi
+          rm -f "${RUNNER_TEMP}"/lbk-cert.p12 "${RUNNER_TEMP}"/AuthKey_*.p8
 
   release:
     if: startsWith(github.ref, 'refs/tags/lbk-v')
@@ -118,6 +252,7 @@ jobs:
           ls -l dist
           cat > notes.md <<EOF
           Self-contained macOS build of Millennium (wrapper-app install, CDP over pipes).
+          Every binary is signed with a Developer ID certificate (hardened runtime, secure timestamp) and notarized by Apple.
 
           Built from ${GITHUB_SHA} on branch lbk-macos. No Homebrew needed: OpenSSL is linked statically and every binary depends only on /usr/lib and /System. Minimum macOS ${MACOSX_DEPLOYMENT_TARGET}.
 
