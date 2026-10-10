@@ -283,9 +283,9 @@ static bool sync_text_file(const std::filesystem::path& source, const std::files
     return write_text_file(target, source_content);
 }
 
-static bool resolve_bootstrap_asset_sources(const char* wrapper_directory, std::filesystem::path* loader_source_dir, std::filesystem::path* frontend_source)
+static bool resolve_bootstrap_asset_sources(const std::vector<std::filesystem::path>& wrapper_directories, std::filesystem::path* loader_source_dir, std::filesystem::path* frontend_source)
 {
-    if (!wrapper_directory || !loader_source_dir || !frontend_source) {
+    if (!loader_source_dir || !frontend_source) {
         return false;
     }
 
@@ -321,7 +321,11 @@ static bool resolve_bootstrap_asset_sources(const char* wrapper_directory, std::
         candidates.emplace_back(configured_assets_root);
     }
 
-    candidates.emplace_back(std::filesystem::path(wrapper_directory) / ".." / "Resources" / "millennium-assets");
+    /* LaunchServices may exec the realpath of the symlinked bundle executable, so try both the app bundle and runtime layouts for every directory. */
+    for (const std::filesystem::path& wrapper_directory : wrapper_directories) {
+        candidates.emplace_back(wrapper_directory / ".." / "Resources" / "millennium-assets");
+        candidates.emplace_back(wrapper_directory / "millennium-assets");
+    }
 
     for (const std::filesystem::path& candidate : candidates) {
         std::error_code canonical_error;
@@ -354,7 +358,7 @@ static bool resolve_bootstrap_asset_sources(const char* wrapper_directory, std::
     return false;
 }
 
-static bool prepare_macos_bootstrap_assets(const char* steam_executable_path)
+static bool prepare_macos_bootstrap_assets(const char* steam_executable_path, const char* launcher_argv0)
 {
     const char* separator = strrchr(steam_executable_path, '/');
     if (!separator) {
@@ -371,20 +375,35 @@ static bool prepare_macos_bootstrap_assets(const char* steam_executable_path)
         return false;
     }
 
+    std::vector<std::filesystem::path> wrapper_directories;
+    auto add_parent_directory = [&wrapper_directories](const char* path)
+    {
+        if (!path || path[0] != '/') {
+            return;
+        }
+        const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+        if (std::find(wrapper_directories.begin(), wrapper_directories.end(), parent) == wrapper_directories.end()) {
+            wrapper_directories.push_back(parent);
+        }
+    };
+
     char executable_path[PATH_MAX];
-    if (!get_executable_path_raw(executable_path, sizeof(executable_path))) {
-        return false;
+    if (get_executable_path_raw(executable_path, sizeof(executable_path))) {
+        add_parent_directory(executable_path);
     }
-
-    char wrapper_directory_buffer[PATH_MAX];
-    strncpy(wrapper_directory_buffer, executable_path, sizeof(wrapper_directory_buffer) - 1);
-    wrapper_directory_buffer[sizeof(wrapper_directory_buffer) - 1] = '\0';
-
-    const char* wrapper_directory = dirname(wrapper_directory_buffer);
+    add_parent_directory(launcher_argv0);
+    char resolved_executable_path[PATH_MAX];
+    if (get_executable_path(resolved_executable_path, sizeof(resolved_executable_path))) {
+        add_parent_directory(resolved_executable_path);
+    }
 
     std::filesystem::path loader_source_dir;
     std::filesystem::path frontend_source;
-    if (!resolve_bootstrap_asset_sources(wrapper_directory, &loader_source_dir, &frontend_source)) {
+    if (!resolve_bootstrap_asset_sources(wrapper_directories, &loader_source_dir, &frontend_source)) {
+        fprintf(stderr, "[Millennium] No millennium-assets found (set %s). Searched:\n", kAssetsRootEnv);
+        for (const std::filesystem::path& directory : wrapper_directories) {
+            fprintf(stderr, "[Millennium]   %s/../Resources/millennium-assets, %s/millennium-assets\n", directory.c_str(), directory.c_str());
+        }
         return false;
     }
 
@@ -558,7 +577,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    if (!prepare_macos_bootstrap_assets(target_steam_path)) {
+    if (!prepare_macos_bootstrap_assets(target_steam_path, argc > 0 ? argv[0] : nullptr)) {
         remove_cef_remote_debugging_marker(target_steam_path);
         fprintf(stderr, "[Millennium] Failed to prepare macOS bootstrap assets.\n");
         return 1;
